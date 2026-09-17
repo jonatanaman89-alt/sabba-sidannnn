@@ -1,20 +1,26 @@
 # SABBA säljtopp — läser sales-boten i Telegram och skriver till Supabase.
 # Hemligheterna läggs in under repo-Settings → Secrets and variables → Actions.
 #
-# Vad som startar körningarna:
-#  1. Supabase (pg_cron-jobbet "sabba-saljsynk") anropar workflow_dispatch var 10:e
-#     minut. Det är huvudtriggern — GitHubs eget schema stryps till var 2–5:e timme.
-#     Kräver en GitHub-token i Supabase Vault med namnet github_saljsynk_token.
-#  2. Schemat nedan är bara reserv om token saknas eller gått ut. Minut 23, inte
-#     hel timme — där är GitHub som mest belastat och tappar flest körningar.
+# Varför en loop i stället för "cron: */10"?
+# GitHub garanterar inte schemalagda körningar. Med */15 startades den i praktiken
+# bara var 2–5:e timme. Lösningen är att låta EN körning leva länge och synka var
+# 10:e minut inifrån jobbet, i stället för att lita på att GitHub startar den ofta.
+#
+# Schemat försöker starta varje timme. Lyckas det medan en loop redan lever
+# ställs den nya i kö (concurrency nedan) och tar över när den gamla tar slut —
+# så täckningen blir obruten även om GitHub hoppar över de flesta starterna.
+#
+# Kostnad: repot är PUBLIKT, och då är Actions-minuter gratis utan tak. Görs det
+# privat igen drar det här ~1400 minuter per dygn — då måste loopen bort.
 name: SABBA säljtopp
 
 on:
   schedule:
+    # Minut 23, inte hel timme: där är GitHub som mest belastat och tappar flest.
     - cron: "23 * * * *"
   workflow_dispatch: {}
 
-# Aldrig två körningar samtidigt: samma Telegram-session får inte vara inloggad
+# Aldrig två loopar samtidigt: samma Telegram-session får inte vara inloggad
 # från två ställen, och två skrivningar till samma nyckel kan krocka.
 concurrency:
   group: tg-sync
@@ -26,7 +32,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,8 +41,7 @@ jobs:
           cache: pip
       - name: Installera beroenden
         run: pip install --quiet -r requirements.txt
-      - name: Synka säljtoppen
-        run: python tg_leaderboard.py
+      - name: Synka var 10:e minut
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -45,3 +50,37 @@ jobs:
           CHATTER_MAP: ${{ secrets.CHATTER_MAP }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -u
+          INTERVAL=600                    # 10 minuter mellan passen
+          STOP=$(( $(date +%s) + 19800 )) # sluta efter 5,5 h, marginal till timeout
+
+          pass=0; ok=0; fail=0; streak=0
+
+          while :; do
+            pass=$((pass + 1))
+            echo "::group::Pass $pass  ($(date -u +%H:%M:%S) UTC)"
+            if python tg_leaderboard.py; then
+              ok=$((ok + 1)); streak=0
+            else
+              fail=$((fail + 1)); streak=$((streak + 1))
+              echo "::warning::pass $pass misslyckades (i rad: $streak)"
+            fi
+            echo "::endgroup::"
+
+            # Tre raka smällar = något är verkligen fel. Avbryt rött direkt i stället
+            # för att mala vidare i timmar och till slut rapportera grönt.
+            if [ "$streak" -ge 3 ]; then
+              echo "::error::tre pass i rad misslyckades — avbryter"
+              exit 1
+            fi
+
+            [ "$(date +%s)" -ge "$STOP" ] && break
+            sleep "$INTERVAL"
+          done
+
+          echo "Sammanfattning: $pass pass, $ok lyckade, $fail misslyckade."
+          if [ "$ok" -eq 0 ]; then
+            echo "::error::inget pass lyckades under hela körningen"
+            exit 1
+          fi

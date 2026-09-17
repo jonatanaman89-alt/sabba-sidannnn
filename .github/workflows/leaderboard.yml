@@ -1,0 +1,47 @@
+# SABBA säljtopp — läser sales-boten i Telegram och skriver till Supabase.
+# Hemligheterna läggs in under repo-Settings → Secrets and variables → Actions.
+#
+# Vad som startar körningarna:
+#  1. Supabase (pg_cron-jobbet "sabba-saljsynk") anropar workflow_dispatch var 10:e
+#     minut. Det är huvudtriggern — GitHubs eget schema stryps till var 2–5:e timme.
+#     Kräver en GitHub-token i Supabase Vault med namnet github_saljsynk_token.
+#  2. Schemat nedan är bara reserv om token saknas eller gått ut. Minut 23, inte
+#     hel timme — där är GitHub som mest belastat och tappar flest körningar.
+name: SABBA säljtopp
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch: {}
+
+# Aldrig två körningar samtidigt: samma Telegram-session får inte vara inloggad
+# från två ställen, och två skrivningar till samma nyckel kan krocka.
+concurrency:
+  group: tg-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Installera beroenden
+        run: pip install --quiet -r requirements.txt
+      - name: Synka säljtoppen
+        run: python tg_leaderboard.py
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          SALES_BOT: ${{ secrets.SALES_BOT }}
+          CHATTER_MAP: ${{ secrets.CHATTER_MAP }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

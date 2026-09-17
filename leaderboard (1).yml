@@ -1,0 +1,109 @@
+name: SABBA säljtopp
+
+# Varför en loop i stället för "cron: */15"?
+# GitHub garanterar inte schemalagda körningar. Vid belastning fördröjs de eller
+# hoppas över helt, och ju tätare schema desto mer stryps det. Lösningen är att
+# starta EN körning i timmen och låta den jobba hela timmen: synken körs var 5:e
+# minut inifrån jobbet i stället för att förlita sig på att GitHub startar den.
+#
+# OBS kostnad: ett jobb som lever ~55 min drar ~1400 Actions-minuter per dygn.
+# Gratis på publika repos. Är repot PRIVAT spränger det kvoten direkt — se
+# "Privat repo" längst ned i den här filen.
+
+on:
+  schedule:
+    # Minut 7, inte 0. Alla andras scheman ligger på hel timme, och det är precis
+    # där GitHub har som mest att göra och börjar kasta körningar.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+# Hindrar två loopar från att köra samtidigt (t.ex. schema + manuell start),
+# vilket annars kan ge dubbelräkning i dedupfönstret.
+concurrency:
+  group: saljtopp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Installera beroenden
+        run: pip install --quiet telethon requests
+
+      - name: Synka i en timme
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          SALES_BOT: ${{ secrets.SALES_BOT }}
+          CHATTER_MAP: ${{ secrets.CHATTER_MAP }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -u
+          SCRIPT=leaderboard.py          # <-- byt om filen heter något annat
+          INTERVAL=300                   # 5 minuter mellan passen
+          STOP=$(( $(date +%s) + 3300 )) # sluta efter 55 min, marginal till timeout
+
+          pass=0; ok=0; fail=0; streak=0
+
+          while :; do
+            pass=$((pass + 1))
+            echo "::group::Pass $pass  ($(date -u +%H:%M:%S) UTC)"
+
+            if python "$SCRIPT"; then
+              ok=$((ok + 1)); streak=0
+            else
+              fail=$((fail + 1)); streak=$((streak + 1))
+              echo "::warning::pass $pass misslyckades (i rad: $streak)"
+            fi
+            echo "::endgroup::"
+
+            # Tre raka smällar = något är verkligen fel. Avbryt rött direkt i
+            # stället för att mala vidare i 55 minuter och rapportera grönt.
+            if [ "$streak" -ge 3 ]; then
+              echo "::error::tre körningar i rad misslyckades — avbryter"
+              exit 1
+            fi
+
+            [ "$(date +%s)" -ge "$STOP" ] && break
+            sleep "$INTERVAL"
+          done
+
+          echo "Sammanfattning: $pass pass, $ok lyckade, $fail misslyckade."
+
+          # Inte ett enda lyckat pass på en timme ska aldrig se grönt ut.
+          if [ "$ok" -eq 0 ]; then
+            echo "::error::inget pass lyckades under hela körningen"
+            exit 1
+          fi
+
+# ── Privat repo ──────────────────────────────────────────────────────────────
+# Kör då i stället ett kort schema och acceptera att en del körningar tappas:
+#
+#   on:
+#     schedule:
+#       - cron: '3,18,33,48 * * * *'
+#     workflow_dispatch:
+#
+# och ta bort loop-steget ovan till förmån för ett enkelt "python leaderboard.py".
+# Vill du ha pålitlighet på ett privat repo måste triggern komma utifrån — en
+# extern cron-tjänst eller pg_cron i Supabase som anropar GitHubs
+# workflow_dispatch-endpoint. Det kräver en GitHub-token, så det bör sättas upp
+# av dig direkt, inte klistras in i en chatt.
+#
+# ── Läs också ────────────────────────────────────────────────────────────────
+# Schemalagda workflows stängs av automatiskt efter 60 dagar utan commits i
+# repot. Ligger projektet stilla en period måste schemat startas om för hand.

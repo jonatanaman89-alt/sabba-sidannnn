@@ -1,13 +1,13 @@
-"""SABBA Chattar-leaderboard (GitHub Actions → Supabase)
-========================================================
-Loggar in som teamets läsarkonto (Telethon), skannar KVIQsales-botens
-"New Sale"-meddelanden och räknar ihop VECKOTOTALER PER CHATTARE (fältet
-"Sent by:"). Skriver till Supabase-tabellen sabba_data, nyckeln
-sabba:chatters:v1 — 🏆-toppen på Sales-sidan uppdateras live via realtidssynken.
+"""SABBA: kunderna ur Telegram (GitHub Actions → Supabase)
+==========================================================
+Sedan 2026-10-30 kommer köpen i SABBA från KVIQA (serverfunktionen kviqa i Supabase, varje minut). KVIQA lämnar aldrig
+ut köparens namn, så det här skriptet läser bara KVIQsales-botens "New Sale"/"New Tip"-meddelanden i Telegram och lägger
+dem i tabellen telegram_kop (köparen, modellen, beloppet, tiden). Databasen kopplar sedan varje meddelande till sitt köp i
+KVIQA (telegram_koppla: samma modell, nära i tid och samma belopp) och sätter kunden på köpet — i säljflödet och arkivet.
+Skriptet skriver ALDRIG säljflödet (sabba:chatters:v1) längre.
 
-Startas var 10:e minut av Supabase (pg_cron → workflow_dispatch). Håller reda på senast
-lästa meddelande per chatt ("last") så varje körning bara hämtar det nya —
-första körningen backfyller historiken.
+Varje körning hämtar bara meddelanden efter det senast lästa per chatt (telegram_senaste); första körningen läser
+historiken bakåt (upp till 3000 per chatt och sökord), så att kunderna kommer på köpen sedan Telegram-läsaren stannade.
 
 Miljövariabler (GitHub repo-secrets):
   TG_API_ID, TG_API_HASH   — från https://my.telegram.org
@@ -18,22 +18,15 @@ Miljövariabler (GitHub repo-secrets):
   SUPABASE_SERVICE_KEY     — service_role-nyckeln (får BARA ligga som GitHub-secret)
 """
 
-import json
 import os
 import re
 import sys
-import time
-from zoneinfo import ZoneInfo
 
 import requests
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
-TZ = ZoneInfo("Europe/Stockholm")
-DOC_KEY = "sabba:chatters:v1"
-MAX_SALES_KEPT = 500
-
-# Exempel på meddelanden som parsas (sales OCH tips räknas):
+# Exempel på meddelanden som parsas (sales OCH tips):
 #   💰 New Sale: $12.00 (Dropfans, excl. VAT)
 #   💸 New Tip: $400.00 (Dropfans, excl. VAT)
 #   Platform: Telegram
@@ -69,50 +62,24 @@ def parse_sale(text):
     }
 
 
-def week_id(dt):
-    local = dt.astimezone(TZ)
-    y, w, _ = local.isocalendar()
-    return f"{y}-W{w:02d}"
-
-
 class Supa:
-    """Läser/skriver raden (key, value, updated_at) i tabellen sabba_data via REST."""
+    """Tabellen telegram_kop och funktionerna telegram_senaste/telegram_koppla via REST (service_role)."""
 
     def __init__(self, url, key):
-        self.base = url.rstrip("/") + "/rest/v1/sabba_data"
-        self.headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        }
+        self.url = url.rstrip("/")
+        self.headers = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
-    def load(self):
-        r = requests.get(self.base, headers=self.headers,
-                         params={"key": f"eq.{DOC_KEY}", "select": "value"}, timeout=30)
+    def rpc(self, namn, body=None):
+        r = requests.post(f"{self.url}/rest/v1/rpc/{namn}", headers=self.headers, json=body or {}, timeout=60)
         r.raise_for_status()
-        rows = r.json()
-        data = {"v": 1, "updatedAt": 0, "weeks": {}, "sales": [], "last": {}}
-        if rows:
-            try:
-                d = json.loads(rows[0].get("value") or "{}")
-                if isinstance(d, dict):
-                    d.setdefault("weeks", {})
-                    d.setdefault("sales", [])
-                    d.setdefault("last", {})
-                    data = d
-            except Exception:
-                pass
-        return data
+        return r.json()
 
-    def save(self, data):
-        r = requests.post(
-            self.base,
-            headers={**self.headers, "Prefer": "resolution=merge-duplicates"},
-            json=[{"key": DOC_KEY, "value": json.dumps(data, ensure_ascii=False),
-                   "updated_at": data["updatedAt"]}],
-            timeout=30,
-        )
-        r.raise_for_status()
+    def spara(self, rader):
+        # Samma meddelande två gånger: det första står kvar (on conflict do nothing)
+        for i in range(0, len(rader), 500):
+            r = requests.post(f"{self.url}/rest/v1/telegram_kop", json=rader[i:i + 500], timeout=60,
+                              headers={**self.headers, "Prefer": "resolution=ignore-duplicates,return=minimal"})
+            r.raise_for_status()
 
 
 def need_env(name):
@@ -137,21 +104,8 @@ def main():
             a, b = pair.split(":", 1)
             cmap[a.strip().lower()] = b.strip()
 
-    data = supa.load()
-    # Dubblettskydd v2: boten kan posta SAMMA sale i flera chattar (stora kanalen +
-    # modellens egen grupp). Utöver meddelande-id:t dedupas därför på ett innehålls-
-    # fingeravtryck (minut + belopp + chattare + modell). Första körningen efter
-    # uppgraderingen byggs allt om från grunden så gamla dubbletter försvinner.
-    # dv 4 = kundnamn (Buyer) sparas — allt byggs om från grunden så historiken får med kunderna.
-    if data.get("dv") != 4:
-        data = {"v": 1, "dv": 4, "updatedAt": 0, "weeks": {}, "sales": [], "last": {}}
-    seen = {s.get("id") for s in data["sales"]}
-    fps = set()
-    for s in data["sales"]:
-        fps.add(f"{int(s.get('t', 0)) // 60}|{s.get('amount')}|{str(s.get('chatter', '')).lower()}|{str(s.get('creator', '')).lower()}")
-    added = 0
-    skipped_dupes = 0
-    errors = []
+    senaste = supa.rpc("telegram_senaste") or {}
+    rader, errors = [], []
 
     # Anslut utan interaktiv inloggning — och ge ett BEGRIPLIGT fel om sessionen dött
     # (i stället för att Telethon frågar efter telefonnummer, vilket inte går här).
@@ -173,64 +127,36 @@ def main():
         for dialog in client.iter_dialogs():
             if not (dialog.is_group or dialog.is_channel):
                 continue
-            last = int(data["last"].get(str(dialog.id), 0))
-            top = last
+            last = int(senaste.get(str(dialog.id), 0) or 0)
             limit = 3000 if last == 0 else 400
             try:
-                msgs = []
                 for term in ("New Sale", "New Tip"):
-                    msgs.extend(client.iter_messages(dialog.id, limit=limit,
-                                                     min_id=last, search=term))
-                for msg in msgs:
-                    if msg.id > top:
-                        top = msg.id
-                    if bot_id is not None and msg.sender_id != bot_id:
-                        continue
-                    sale = parse_sale(msg.raw_text)
-                    if not sale:
-                        continue
-                    sid = f"{dialog.id}:{msg.id}"
-                    if sid in seen:
-                        continue
-                    alias = sale["sent_by"]
-                    name = cmap.get(alias.lower(), alias) or "Okänd"
-                    # Samma sale postad i en annan chatt? Hoppa — den är redan räknad.
-                    # Kollar minuten samt minuterna intill, ifall kopiorna postades
-                    # några sekunder isär över en minutgräns.
-                    mi = int(msg.date.timestamp()) // 60
-                    tail = f"|{sale['amount']}|{name.lower()}|{sale['creator'].lower()}"
-                    if any(f"{m}{tail}" in fps for m in (mi - 1, mi, mi + 1)):
-                        skipped_dupes += 1
-                        continue
-                    seen.add(sid)
-                    fps.add(f"{mi}{tail}")
-                    wid = week_id(msg.date)
-                    w = data["weeks"].setdefault(wid, {})
-                    c = w.setdefault(name, {"count": 0, "total": 0.0})
-                    c["count"] += 1
-                    c["total"] = round(c["total"] + sale["amount"], 2)
-                    data["sales"].append({
-                        "id": sid,
-                        "t": int(msg.date.timestamp()),
-                        "amount": sale["amount"],
-                        "chatter": name,
-                        "creator": sale["creator"],
-                        "site": sale["site"],
-                        "buyer": sale["buyer"],
-                    })
-                    added += 1
-                if top > last:
-                    data["last"][str(dialog.id)] = top
+                    for msg in client.iter_messages(dialog.id, limit=limit, min_id=last, search=term):
+                        if bot_id is not None and msg.sender_id != bot_id:
+                            continue
+                        sale = parse_sale(msg.raw_text)
+                        if not sale or not sale["creator"]:
+                            continue
+                        alias = sale["sent_by"]
+                        rader.append({
+                            "id": f"{dialog.id}:{msg.id}",
+                            "dialog": dialog.id,
+                            "msg": msg.id,
+                            "t": msg.date.isoformat(),
+                            "belopp": sale["amount"],
+                            "saljare": cmap.get(alias.lower(), alias) or None,
+                            "creator": sale["creator"],
+                            "site": sale["site"] or None,
+                            "kopare": sale["buyer"] or None,
+                        })
             except Exception as e:
                 errors.append(f"{dialog.name}: {e}")
 
-    data["sales"].sort(key=lambda s: s["t"])
-    if len(data["sales"]) > MAX_SALES_KEPT:
-        data["sales"] = data["sales"][-MAX_SALES_KEPT:]
-    data["updatedAt"] = int(time.time() * 1000)
-    supa.save(data)
-    print(f"Klart: {added} nya sales, {len(data['weeks'])} veckor, {len(data['sales'])} sparade, "
-          f"{skipped_dupes} dubbletter bortfiltrerade.")
+    unika = list({r["id"]: r for r in rader}.values())
+    if unika:
+        supa.spara(unika)
+    kopplade = supa.rpc("telegram_koppla", {"p_sek": 120})
+    print(f"Klart: {len(unika)} meddelanden från Telegram, {kopplade} köp fick sin kund.")
     for e in errors:
         print("varning:", e)
     # Fel i enskilda chattar fäller inte körningen — men noll åtkomst alls ska synas rött.
